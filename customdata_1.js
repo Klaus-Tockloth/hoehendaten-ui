@@ -1,0 +1,2061 @@
+// customdata.js
+
+(function (global) {
+
+  global.TEXT_CUSTOMDATA_LABEL = "Eigene Objekte";
+
+  let _myCustomdataMap = new Map();
+
+  const defaultLineStyle = {
+    color: "rgba(0, 0, 255, 1)",
+    weight: 4,
+    opacity: 1,
+    dashArray: "", // "5,10",
+    lineCap: "round", // butt, round, square
+  };
+  const defaultPointStyle = {
+    radius: 4,
+    fillColor: "rgba(255, 0, 0, 1)",
+    color: "rgba(0, 0, 0, 1)",
+    weight: 1, 
+    opacity: 1,
+    fillOpacity: 1,
+  };
+
+  const CUSTOMDATA_OPTIONS_DEFAULTS = {
+    styleOptions: {
+      brightness: 100,
+      contrast: 100,
+      saturation: 100,
+      opacity: 100,
+      blendMode: "normal",
+    },
+    lineStyle: defaultLineStyle,
+    pointStyle: defaultPointStyle,
+  };
+  
+  let _customDataOptionsLast = { ...CUSTOMDATA_OPTIONS_DEFAULTS };
+
+  let fileInput = null;
+
+  const CUSTOMDATA_DIR_NAME = "customdata_files";
+  const CUSTOMDATA_MASTER_NAME = "customdata_master.json";
+  
+  global.initcustomdata = async function () {
+    
+    await _loadSettings();
+
+    /*await*/ loadCustomData();
+    
+    applyGlobalCustomDataStyleToPane();
+
+    if (!fileInput) {
+      fileInput = document.createElement("input");
+      fileInput.type = "file";     
+      fileInput.accept = ".gpx, .kml, .json, .geojson";
+      fileInput.style.display = "none"; 
+      document.body.appendChild(fileInput); 
+      fileInput.addEventListener("change", handleFileSelect); 
+    }
+
+    makeCustomDataMenu();
+   
+    if (typeof global.createSidepanel === "function") {
+      global.sidepanel = global.createSidepanel({
+        type: "customdata", 
+        label: global.TEXT_CUSTOMDATA_LABEL, 
+        loadFn: loadCustomDataLayers, 
+        saveFn: saveCustomDataLayers, 
+        panelHtmlFn: (idSuffix) => global.getCustomDataItemPanelHtml(idSuffix), 
+        panelHelperFn: (idSuffix) => global.initCustomDataItemPanelHelper(idSuffix), 
+        mode: global.MODE_NONE, 
+        array: _myCustomdataMap, 
+        onAction: ({ type: actionType, name }) => {
+          console.log(`Sidepanel action: ${actionType}, Name: ${name}`);
+        },
+      });
+    }
+   
+    global.getCustomDataLayers = () => _myCustomdataMap;
+
+    global.toggleCustomDataLayerVisibility = async (id, visible) => {
+      const item = _myCustomdataMap.get(id);
+      if (item) {
+        item.visible = visible;
+        if (item.layer && global.map) {
+          // Ensure layer object exists and map is defined
+          if (visible && !global.map.hasLayer(item.layer)) {
+            item.layer.addTo(global.map);
+          } else if (!visible && global.map.hasLayer(item.layer)) {
+            global.map.removeLayer(item.layer);
+          }
+        } else if (!item.layer && visible) {
+          console.warn(
+            `Layer object for ID ${id} is missing, cannot toggle visibility on map.`
+          );
+        }
+
+        if (
+          typeof global.sidepanel !== "undefined" &&
+          global.sidepanel.isVisible() &&
+          global.sidepanel.currentType === "customdata"
+        ) {
+          global.sidepanel.showCustomData("customdata"); 
+        }
+      } else {
+        console.warn(`Item with ID ${id} not found for visibility toggle.`);
+      }
+    };
+
+    global.removeCustomDataLayer = async (id) => {
+      const item = _myCustomdataMap.get(id);
+      if (item) {
+        if (item.layer && global.map && global.map.hasLayer(item.layer)) {
+          
+          global.map.removeLayer(item.layer);
+        }
+        if (item.opfsPath) {
+          const fileName = item.opfsPath.split("/").pop();
+          await deleteCustomDataFile(fileName);
+        }
+        _myCustomdataMap.delete(id); 
+        await saveMetadata();
+        console.log(
+          `CustomData layer "${item.name}" (ID: ${id}) removed from map and OPFS.`
+        );
+
+        if (
+          typeof global.sidepanel !== "undefined" &&
+          global.sidepanel.isVisible() &&
+          global.sidepanel.currentType === "customdata"
+        ) {
+          global.sidepanel.showCustomData("customdata");
+        }
+      } else {
+        console.warn(`Item with ID ${id} not found to remove.`);
+      }
+    };
+  };
+ 
+  async function clearAllCustomDataLayers() {
+    if (
+      !confirm(
+        "Wirklich alle geladenen CUSTOMDATA-Objekte von der Karte entfernen und den lokalen Speicher leeren?"
+      )
+    ) {
+      return;
+    }
+
+    _myCustomdataMap.forEach((item) => {
+      if (item.layer && global.map.hasLayer(item.layer)) {
+        global.map.removeLayer(item.layer);
+      }
+    });
+ 
+    for (const item of _myCustomdataMap.values()) {
+      if (item.opfsPath) {
+        const fileNameInOpfs = item.opfsPath.split("/").pop(); 
+        await deleteCustomDataFile(fileNameInOpfs);
+      }
+    }
+
+    _myCustomdataMap.clear(); 
+
+    await saveMetadata(); 
+   
+    _customDataOptionsLast = { ...CUSTOMDATA_OPTIONS_DEFAULTS };
+    await _saveSettings();
+    applyGlobalCustomDataStyleToPane(); 
+
+    console.log(
+      "Alle CUSTOMDATA-Objekte von der Karte entfernt und lokaler Speicher geleert."
+    );
+   
+    if (
+      typeof global.sidepanel !== "undefined" &&
+      global.sidepanel.isVisible() &&
+      global.sidepanel.currentType === "customdata"
+    ) {
+      global.sidepanel.showCustomData("customdata");
+    }
+  }
+
+  function displayCustomDataGeoJson(
+    geojson,
+    fileName,
+    id,
+    opfsPath,
+    fileType,
+    initialVisible = true,
+    loadedStyle = null
+  ) {
+    if (!geojson || !global.map) {
+      console.error("Ungültige GeoJSON-Daten oder Karte nicht initialisiert.");
+      return null;
+    }
+
+    const pane = getOrCreatePane(map, "customdata");
+    if (!pane) {
+      console.error(
+        "Failed to get or create Leaflet pane for customdata layers. Cannot display GeoJSON."
+      );
+      return null;
+    }
+   
+    let layerMetadata = _myCustomdataMap.get(id);
+   
+    if (!layerMetadata) {
+      layerMetadata = {
+        id: id,
+        name: fileName,
+        opfsPath: opfsPath,
+        layer: null, 
+        visible: initialVisible,
+        fileType: fileType,
+        style: {
+          line: {
+            ..._customDataOptionsLast.lineStyle,
+            ...(loadedStyle && loadedStyle.line ? loadedStyle.line : {}),
+          },
+          point: {
+            ..._customDataOptionsLast.pointStyle,
+            ...(loadedStyle && loadedStyle.point ? loadedStyle.point : {}),
+          },
+        },
+      };
+    } else {      
+      layerMetadata.style = layerMetadata.style || {};
+      layerMetadata.style.line = layerMetadata.style.line || {};
+      layerMetadata.style.point = layerMetadata.style.point || {};
+      layerMetadata.style.line = {
+        ..._customDataOptionsLast.lineStyle,
+        ...layerMetadata.style.line,
+      };
+      layerMetadata.style.point = {
+        ..._customDataOptionsLast.pointStyle,
+        ...layerMetadata.style.point,
+      };
+      
+      layerMetadata.name = fileName;
+      layerMetadata.opfsPath = opfsPath;
+      layerMetadata.fileType = fileType;
+    
+      layerMetadata.visible =
+        typeof initialVisible === "boolean"
+          ? initialVisible
+          : layerMetadata.visible;
+    }
+
+    const effectiveLineStyle = layerMetadata.style.line;
+    const effectivePointStyle = layerMetadata.style.point;
+
+    // console.log("displayCustomDataGeoJson effectiveLineStyle: ", effectiveLineStyle);
+    // console.log("displayCustomDataGeoJson effectivePointStyle: ", effectivePointStyle);
+
+    const customdataLayer = L.geoJSON(geojson, {
+      pane: pane, 
+      style: function (feature) {
+        if (
+          feature.geometry.type === "LineString" ||
+          feature.geometry.type === "MultiLineString"
+        ) {
+          let styleToApply = {
+            color: effectiveLineStyle.color,
+            weight: effectiveLineStyle.weight,
+            opacity: effectiveLineStyle.opacity,
+            dashArray: effectiveLineStyle.dashArray || null,
+            lineCap: effectiveLineStyle.lineCap || "round",
+          };
+
+          if (
+            feature.properties &&
+            (feature.properties.type === "track" ||
+              feature.properties.hasOwnProperty("trackseg") ||
+              feature.properties.hasOwnProperty("gx_track"))
+          ) {
+            styleToApply.dashArray = null;
+            styleToApply.color = effectiveLineStyle.trackColor; 
+          }
+          return styleToApply;
+        }
+        return {}; 
+      },
+      pointToLayer: function (feature, latlng) {
+        if (feature.geometry.type === "Point") {
+          if (feature.properties && feature.properties.icon) {
+            return L.marker(latlng, {
+              pane: pane,
+              icon: L.icon({
+                pane: pane,
+                iconUrl: feature.properties.icon,
+                iconSize: [32, 32],
+                iconAnchor: [16, 32], 
+                popupAnchor: [0, -32], 
+              }),
+            });
+          }
+
+          return L.circleMarker(latlng, {
+            radius: effectivePointStyle.radius,
+            fillColor: effectivePointStyle.fillColor,
+            color: effectivePointStyle.color,
+            weight: effectivePointStyle.weight,
+            opacity: effectivePointStyle.opacity,
+            fillOpacity: effectivePointStyle.fillOpacity,
+            pane: pane,
+          });
+        }
+        return null; 
+      },
+      onEachFeature: function (feature, layer) {       
+        let popupContent = "";
+        if (feature.properties) {
+          if (feature.properties.name) {
+            popupContent += `<b>${feature.properties.name}</b><br>`;
+          }
+          
+          if (feature.properties.description) {            
+            popupContent += `${feature.properties.description}<br>`;
+          } else if (feature.properties.desc) {           
+            popupContent += `${feature.properties.desc}<br>`;
+          }
+          if (feature.properties.sym) {
+            popupContent += `Symbol: ${feature.properties.sym}<br>`;
+          }
+          if (feature.properties.cmt) {
+            popupContent += `Kommentar: ${feature.properties.cmt}<br>`;
+          }
+          if (feature.properties.ele !== undefined) {
+            popupContent += `Höhe: ${feature.properties.ele} m<br>`;
+          }
+          if (feature.properties.time) {
+            try {
+              popupContent += `Zeit: ${new Date(
+                feature.properties.time
+              ).toLocaleString()}<br>`;
+            } catch (e) {
+            }
+          }
+          // If no specific content, add a few generic properties (up to 3)
+          if (!popupContent && Object.keys(feature.properties).length > 0) {
+            let genericProps = Object.keys(feature.properties)
+              .filter(
+                (key) =>
+                  key !== "name" &&
+                  key !== "description" &&
+                  key !== "desc" &&
+                  key !== "sym" &&
+                  key !== "cmt" &&
+                  key !== "ele" &&
+                  key !== "time" &&
+                  key !== "icon"
+              )
+              .slice(0, 3); // Show max 3 other properties
+            if (genericProps.length > 0) {
+              popupContent += "Weitere Eigenschaften:<br>";
+              genericProps.forEach((key) => {
+                popupContent += `&nbsp;&nbsp;<b>${key}</b>: ${feature.properties[key]}<br>`;
+              });
+            }
+          }
+        }
+
+        if (popupContent) {
+          layer.bindPopup(popupContent);
+        }
+      },
+    });
+
+    layerMetadata.layer = customdataLayer;
+
+    if (layerMetadata.visible) {
+      customdataLayer.addTo(global.map);
+     
+      if (      
+        customdataLayer.getBounds().isValid() &&
+              !global.map.getBounds().contains(customdataLayer.getBounds())
+      ) {
+        // KTO
+        // global.map.fitBounds(customdataLayer.getBounds());
+        global.map.fitBounds(customdataLayer.getBounds(), { maxZoom: 16 }); 
+      } else if (!customdataLayer.getBounds().isValid()) {
+        console.warn(
+          `Die hochgeladene Datei "${fileName}" enthält keine gültigen Geometrien zum Anpassen der Kartenansicht.`
+        );
+      }
+    }
+  
+    _myCustomdataMap.set(id, layerMetadata);   
+
+    return customdataLayer;
+  }
+  
+  function parseFileContentToGeoJson(fileContent, fileType, fileName) {
+    let geojson = null;
+    const parser = new DOMParser(); 
+
+    try {
+      if (fileType === "gpx") {
+        const gpxDom = parser.parseFromString(fileContent, "text/xml");
+
+        const errorNode = gpxDom.querySelector("parsererror");
+        if (errorNode) {
+          console.error(
+            "Fehler beim Parsen der GPX-XML-Daten:",
+            errorNode.textContent
+          );
+          alert(
+            "Fehler beim Parsen der GPX-Datei. Überprüfen Sie das XML-Format."
+          );
+          return null;
+        }
+
+        if (typeof toGeoJSON === "undefined" || !toGeoJSON.gpx) {
+          console.error(
+            "Die 'toGeoJSON'-Bibliothek oder die GPX-Methode ist nicht verfügbar. Stelle sicher, dass togeojson.js geladen ist."
+          );
+          alert(
+            "Fehler: Konvertierungsbibliothek für GPX nicht gefunden. GPX kann nicht verarbeitet werden."
+          );
+          return null;
+        }
+        geojson = toGeoJSON.gpx(gpxDom);
+      } else if (fileType === "kml") {
+        const kmlDom = parser.parseFromString(fileContent, "text/xml");
+
+        const errorNode = kmlDom.querySelector("parsererror");
+        if (errorNode) {
+          console.error(
+            "Fehler beim Parsen der KML-XML-Daten:",
+            errorNode.textContent
+          );
+          alert(
+            "Fehler beim Parsen der KML-Datei. Überprüfen Sie das XML-Format."
+          );
+          return null;
+        }
+
+        if (typeof toGeoJSON === "undefined" || !toGeoJSON.kml) {
+          console.error(
+            "Die 'toGeoJSON'-Bibliothek oder die KML-Methode ist nicht verfügbar. Stelle sicher, dass togeojson.js geladen ist."
+          );
+          alert(
+            "Fehler: Konvertierungsbibliothek für KML nicht gefunden. KML kann nicht verarbeitet werden."
+          );
+          return null;
+        }
+        geojson = toGeoJSON.kml(kmlDom);
+      } else if (fileType === "json" || fileType === "geojson") {
+        geojson = JSON.parse(fileContent);
+        if (
+          !geojson ||
+          !geojson.type ||
+          ![
+            "FeatureCollection",
+            "Feature",
+            "GeometryCollection",
+            "Point",
+            "LineString",
+            "Polygon",
+            "MultiPoint",
+            "MultiLineString",
+            "MultiPolygon",
+          ].includes(geojson.type)
+        ) {
+          console.error(
+            `Die Datei "${fileName}" ist ungültiges GeoJSON oder hat einen unbekannten Typ.`
+          );
+          alert(
+            `Die ausgewählte Datei "${fileName}" ist ungültiges GeoJSON oder hat einen unbekannten Typ.`
+          );
+          return null;
+        }
+      } else {
+        alert("Interner Fehler: Unbekannter Dateityp zur Verarbeitung.");
+        return null;
+      }
+     
+      if (
+        geojson &&
+        geojson.type === "FeatureCollection" &&
+        (!geojson.features || geojson.features.length === 0)
+      ) {
+        console.warn(
+          `Datei "${fileName}" wurde geparst, aber es wurden keine GeoJSON-Features gefunden.`
+        );
+        alert(
+          `Die Datei "${fileName}" enthält keine interpretierbaren Geodaten (Tracks, Routen, Wegpunkte, Features).`
+        );
+        return null;
+      }
+      if (!geojson) {
+        console.warn(
+          `Datei "${fileName}" konnte nicht in ein GeoJSON-Objekt konvertiert/gelesen werden.`
+        );
+        alert(
+          `Die Datei "${fileName}" konnte nicht als gültiges GeoJSON gelesen werden.`
+        );
+        return null;
+      }
+      return geojson;
+    } catch (error) {
+      console.error(
+        `Fehler beim Parsen oder Verarbeiten der Datei "${fileName}" (${fileType}):`,
+        error
+      );
+      alert(
+        `Ein unerwarteter Fehler ist beim Verarbeiten der Datei "${fileName}" aufgetreten: ${error.message}`
+      );
+      return null;
+    }
+  }
+ 
+  async function handleFileSelect(event) {
+    const files = event.target.files;
+    if (files.length === 0) {
+      console.log("Keine Datei ausgewählt.");
+      return;
+    }
+
+    const file = files[0];
+    const fileName = file.name;
+    const fileExtension = getFileExtension(fileName);
+    
+    if (!["gpx", "json", "geojson", "kml"].includes(fileExtension)) {
+      alert(
+        "Bitte wählen Sie eine Datei mit der Endung .gpx, .kml, .json oder .geojson aus."
+      );
+      event.target.value = "";
+      return;
+    }
+
+    const reader = new FileReader();
+
+    reader.onload = async function (e) {
+      const fileContent = e.target.result;
+      const fileId = generateUUID(); 
+      const fileNameInOpfs = `${fileId}.${fileExtension}`; 
+      const opfsPath = `${CUSTOMDATA_DIR_NAME}/${fileNameInOpfs}`; 
+
+      const geojson = parseFileContentToGeoJson(
+        fileContent,
+        fileExtension,
+        fileName
+      );
+
+      if (geojson) {
+        displayCustomDataGeoJson(
+          geojson,
+          fileName,
+          fileId,
+          opfsPath,
+          fileExtension,
+          true
+        );
+        
+        persist(CUSTOMDATA_DIR_NAME, fileNameInOpfs, fileContent);
+
+        console.log(`file ${fileName} imported`);
+
+        if (document.querySelector(".side-panel.open.data"))
+          global.sidepanel.showCustomData("customdata");
+
+        // macht das gleiche
+        /*
+        if (
+          typeof global.sidepanel !== "undefined" &&
+          global.sidepanel.isVisible() &&
+          global.sidepanel.currentType === "customdata"
+        ) {
+           global.sidepanel.showCustomData("customdata");
+        }
+        */
+
+        await saveMetadata();
+      }
+
+      event.target.value = ""; 
+    };
+
+    reader.onerror = function (e) {
+      console.error(
+        `Fehler beim Lesen der Datei "${fileName}" mit FileReader:`,
+        e
+      );
+      alert(`Fehler beim Lesen der Datei "${fileName}".`);
+      event.target.value = "";
+    };
+
+    reader.readAsText(file);
+  }
+
+  function applyGlobalCustomDataStyleToPane() {
+    if (!global.map || !global.map.getPane) {      
+      return;
+    }
+  
+    let customDataPane = getOrCreatePane(map, "customdata");
+   
+    if (!customDataPane) {
+      console.warn(
+        "Leaflet pane 'customdata' could not be obtained or created. Skipping global style application."
+      );
+      return;
+    }
+
+    const styleOptions = _customDataOptionsLast.styleOptions;
+    if (!styleOptions) {
+      console.warn("CustomData global style options not loaded.");
+      return;
+    }
+
+    let filterString = "";
+    if (styleOptions.brightness !== 100)
+      filterString += `brightness(${styleOptions.brightness}%) `;
+    if (styleOptions.contrast !== 100)
+      filterString += `contrast(${styleOptions.contrast}%) `;
+    if (styleOptions.saturation !== 100)
+      filterString += `saturate(${styleOptions.saturation}%) `;
+
+    // console.log("filterString: ",filterString);
+    /* TODO !!! */
+    customDataPane.style.filter = filterString.trim();
+    customDataPane.style.opacity = (styleOptions.opacity / 100).toFixed(2);
+    customDataPane.style.mixBlendMode = styleOptions.blendMode;    
+  }
+  
+  global.redrawCustomData = async function () {
+    // console.log("Redrawing all custom data layers...");
+
+    const currentLayers = Array.from(_myCustomdataMap.values()); 
+    _myCustomdataMap.clear(); 
+
+    for (const item of currentLayers) {
+      if (item.layer && global.map && global.map.hasLayer(item.layer)) {
+        global.map.removeLayer(item.layer);
+        
+      }
+
+      if (item.opfsPath) {
+        const fileName = item.opfsPath.split("/").pop();
+        const fileContent = await loadCustomDataFile(fileName);
+
+        if (fileContent) {          
+          const geojson = parseFileContentToGeoJson(
+            fileContent,
+            item.fileType,
+            item.name
+          );
+
+          if (geojson) {    
+            displayCustomDataGeoJson(
+              geojson,
+              item.name,
+              item.id,
+              item.opfsPath,
+              item.fileType,
+              item.visible,
+              item.style
+            );
+          }
+        } else {
+          console.warn(
+            `Could not read content for layer "${item.name}" (ID: ${item.id}) from OPFS. Skipping redraw.`
+          );
+        }
+      } else {
+        console.warn(
+          `OPFS path missing for layer "${item.name}" (ID: ${item.id}). Skipping redraw.`
+        );
+      }
+    }
+   
+    applyGlobalCustomDataStyleToPane();
+
+    await saveMetadata();
+
+    // console.log("Finished redrawing all custom data layers.");
+  };
+
+  const getOverallCustomDataVisibility = () => {
+    // checks if at least one item within map has a visible property set to true.
+    return Array.from(_myCustomdataMap.values()).some((item) => item.visible);
+  };
+  
+  function makeCustomDataMenu() {
+    // if (window.innerWidth >= 1280) {
+    if (window.innerWidth > 1024) {
+      createDesktopMenuEntry();
+    } else {
+      createHamburgerMenuEntry();
+    }
+  }
+
+  function createDesktopMenuEntry() {
+    let nav = document.querySelector("nav");
+    if (!nav) {
+      nav = document.createElement("nav");
+      document.body.insertBefore(nav, document.body.firstChild);
+    }
+    nav.classList.add("isNotMobile");
+
+    let ul = nav.querySelector("ul");
+    if (!ul) {
+      ul = document.createElement("ul");
+      nav.appendChild(ul);
+    }
+
+    const li = document.createElement("li");
+    li.classList.add("dropdown");
+
+    const a = document.createElement("a");
+    a.href = "javascript:void(0);";
+    a.innerHTML = global.TEXT_CUSTOMDATA_LABEL; 
+    a.classList.add("dropbtn");
+    a.classList.add("customdata-upload-menu-item");
+
+    const submenu = document.createElement("ul");
+    submenu.classList.add("submenu");
+    li._submenu = submenu; 
+   
+    const addSubmenuButton = (
+      label,
+      handler,
+      iconHtml = "",
+      specificClass = ""
+    ) => {
+      const item = document.createElement("li");
+      const btn = document.createElement("button");
+      btn.innerHTML = iconHtml ? `${iconHtml} ${label}` : label;
+      if (specificClass) btn.classList.add(specificClass);
+      
+      if (!window.matchMedia("(hover: none)").matches) {
+        // If not a touch device
+        btn.addEventListener(
+          "mouseenter",
+          () => (btn.style.background = "#f0f0f0")
+        );
+        btn.addEventListener(
+          "mouseleave",
+          () => (btn.style.background = "transparent")
+        );
+      }
+
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        handler();
+        // Hide menu on click for touch devices or after action (desktop for explicit menu closing)
+        if (window.matchMedia("(hover: none)").matches) {
+          // If it's a touch device
+          if (li._submenu) {
+            li._submenu.style.display = "none"; // Explicitly hide submenu
+          }
+        } else {
+          // For desktop with hover, attempt to "lose focus" of the parent dropdown
+          // by temporarily disabling pointer events. This causes the submenu to hide.
+          li.style.pointerEvents = "none";
+          setTimeout(() => {
+            li.style.pointerEvents = "";
+          }, 100);
+        }
+      });
+      item.appendChild(btn);
+      submenu.appendChild(item);
+      return btn;
+    };
+
+    // --- Submenu Entries ---
+    // Importieren
+    addSubmenuButton(
+      "Importieren",
+      () => {
+        fileInput.click();
+      },
+      ""
+    );
+
+    // Sichtbarkeit 
+    let _visible = true;
+    if (true) {
+      const updateButtonState = (button, isVisible) => {
+        const icon = isVisible
+          ? "assets/eye-solid-full.svg"
+          : "assets/eye-slash-solid-full.svg";
+        const altText = isVisible ? "Sichtbar" : "Unsichtbar";
+        const label = isVisible ? "Sichtbarkeit" : "Sichtbarkeit: unsichtbar";
+
+        button.innerHTML = `<img src="${icon}" alt="${altText}" style="width: 1em; height: 1em; vertical-align: middle;"> ${label}`;
+      };
+
+      const eyeButton = addSubmenuButton(`Sichtbarkeit...`, () => {
+        const currentVisibilityState = togglePaneVisibility(map, 'customdata');
+        updateButtonState(eyeButton, currentVisibilityState);
+      });
+
+      // Set the initial state of the button when it's first created.
+      updateButtonState(eyeButton, true);
+    }
+
+    // Konfiguration
+    addSubmenuButton(
+      "Konfiguration",
+      () => {
+        if (
+          typeof global.sidepanel !== "undefined" &&
+          global.sidepanel.showCustomDataConfiguration
+        ) {
+          global.sidepanel.showCustomDataConfiguration("customdataConfiguration");
+        }
+      },
+      ""
+    );
+
+    // Objektübersicht (Data Panel)
+    addSubmenuButton(
+      "Objektübersicht",
+      () => {
+        if (
+          typeof global.sidepanel !== "undefined" &&
+          global.sidepanel.showCustomData
+        ) {
+          global.sidepanel.showCustomData("customdata");
+        }
+      },
+      ""
+    );
+
+    // Alle eigenen Objekte löschen
+    addSubmenuButton(
+      "Alle eigenen Objekte löschen",
+      async () => {
+        console.log("Desktop Submenu: Alle eigenen Objekte löschen clicked.");
+        await clearAllCustomDataLayers();        
+          },
+      "", // "🗑️"
+    );
+
+    // Hilfe
+    addSubmenuButton("Hilfe", () => {
+      if (
+        typeof global.sidepanel !== "undefined" &&
+        global.sidepanel.showHelpHtml
+      ) {
+        global.sidepanel.showHelpHtml("customdata");
+      }
+    });
+   
+    a.addEventListener("click", function (e) {
+      //console.log("click");
+      e.preventDefault();
+      if (typeof global.deactivateElevationButtons === "function") {
+        global.deactivateElevationButtons();
+      }
+
+      const isTouchDevice = window.matchMedia("(hover: none)").matches;
+      if (isTouchDevice) {       
+        document.querySelectorAll("nav ul .submenu").forEach((sub) => {
+          if (sub !== submenu) {
+            sub.style.display = "none";
+          }
+        });
+        submenu.style.display =
+          submenu.style.display === "flex" ? "none" : "flex";
+      }    
+
+      if (true) {
+        const type = "customdata";
+        if (sidepanel.isVisibleWithData()) {
+            console.log("toggle sidepanel.isVisibleWithData");
+            sidepanel.showCustomData(type);
+          } else if (sidepanel.isVisibleWithOptions()) {
+            console.log("toggle sidepanel.isVisibleWithOptions");
+            sidepanel.showCustomDataConfiguration(type);
+          }
+      }
+    });
+
+    li.appendChild(a);
+    li.appendChild(submenu);
+    ul.appendChild(li);
+    return a;
+  }
+
+  function createHamburgerMenuEntry() {
+    let nav = document.querySelector("nav");
+    if (!nav) {
+      nav = document.createElement("nav");
+      document.body.insertBefore(nav, document.body.firstChild);
+    }
+    nav.classList.add("mobile-nav");
+
+    let panel = document.getElementById("hamburger-panel");
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = "hamburger-panel";
+      panel.style.display = "none";
+      document.body.insertBefore(panel, nav.nextSibling);
+
+      const content = document.createElement("div");
+      content.id = "hamburger-content";
+      panel.appendChild(content);
+    }
+
+    // Create hamburger icon inside nav if it doesn't exist
+    if (!document.getElementById("hamburger-toggle")) {
+      const hamburgerIcon = document.createElement("div");
+      hamburgerIcon.id = "hamburger-toggle";
+      hamburgerIcon.innerHTML = "&#9776;";
+      hamburgerIcon.addEventListener("click", () => {
+        const panel = document.getElementById("hamburger-panel");
+        if (panel)
+          panel.style.display =
+            panel.style.display === "none" ? "block" : "none";
+      });
+      nav.appendChild(hamburgerIcon);
+    }
+
+    const container = document.getElementById("hamburger-content");
+    if (!container) {
+      console.error("Hamburger content container not found.");
+      return;
+    }
+
+    // Ensure status-info exists for mobile
+    if (!document.getElementById("status-info")) {
+      const statusInfo = document.createElement("span");
+      statusInfo.id = "status-info";
+      statusInfo.textContent = "Status";
+      statusInfo.classList.add("nav-status-info");
+      nav.appendChild(statusInfo);
+    }
+
+    // Main "Eigene Objekte" button in the hamburger panel
+    const hamburgerMainBtn = document.createElement("button");
+    hamburgerMainBtn.classList.add("hamburger-menu-main-button");
+    hamburgerMainBtn.classList.add("customdata"); 
+    const btnContent = document.createElement("span");
+    btnContent.textContent = global.TEXT_CUSTOMDATA_LABEL; 
+    const arrow = document.createElement("span");
+    // arrow.textContent = " +";
+    // arrow.style.float = "right";
+    // arrow.style.marginLeft = "10px";
+    // hamburgerMainBtn.appendChild(btnContent);
+    // hamburgerMainBtn.appendChild(arrow);
+    arrow.textContent = "▷";
+    arrow.style.float = "left";
+    arrow.style.marginRight = "10px";
+    hamburgerMainBtn.appendChild(arrow);
+    hamburgerMainBtn.appendChild(btnContent);
+
+    const submenu = document.createElement("div");
+    submenu.classList.add("hamburgerSubmenu");
+    submenu.style.display = "none";
+
+    hamburgerMainBtn.addEventListener("click", (e) => {
+      //console.log("click");
+      e.preventDefault();
+      document
+        .querySelectorAll("#hamburger-content > div.hamburgerSubmenu")
+        .forEach((div) => {
+          if (div !== submenu) div.style.display = "none";
+        });
+      const visible = submenu.style.display === "none";
+      submenu.style.display = visible ? "flex" : "none";
+      // arrow.textContent = visible ? " -" : " +";
+      arrow.textContent = visible ? "▽" : "▷";
+
+      if (true) {
+        const type = "customdata";
+        if (sidepanel.isVisibleWithData()) {
+            console.log("toggle sidepanel.isVisibleWithData");
+            sidepanel.showCustomData(type);
+          } else if (sidepanel.isVisibleWithOptions()) {
+            console.log("toggle sidepanel.isVisibleWithOptions");
+            sidepanel.showCustomDataConfiguration(type);
+          }
+      }
+    });
+
+    container.appendChild(hamburgerMainBtn);
+    container.appendChild(submenu);
+
+    const addSubBtn = (label, handler, iconHtml = "", specificClass = "") => {
+      const btn = document.createElement("button");
+      btn.classList.add("customdata"); // Type class
+      btn.classList.add("hamburgerSubmenuBtn");
+      if (specificClass) btn.classList.add(specificClass);
+      btn.innerHTML = iconHtml ? `${iconHtml} ${label}` : label;
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        handler();
+        document.getElementById("hamburger-panel").style.display = "none"; // Close main panel on action
+      });
+      submenu.appendChild(btn);
+      return btn;
+    };
+
+    // --- Submenu Entries ---
+    // Importieren
+    addSubBtn(
+      "Importieren",
+      () => {
+        console.log("Hamburger Submenu: Importieren clicked.");
+        fileInput.click();
+        document.getElementById("status-info").textContent =
+          global.TEXT_CUSTOMDATA_LABEL; 
+        const infoBtn = document.getElementById("info-button");
+        if (false)
+        if (infoBtn) {
+          infoBtn.textContent = global.TEXT_CUSTOMDATA_LABEL;
+          infoBtn.classList.add("customdata", "nav-green-btn");
+          infoBtn.style.display = "inline-block";
+        }
+        if (typeof global.modeManager !== "undefined") {
+          global.modeManager.set(global.MODE_NONE, "customdata");
+        }
+        if (global.map) global.map.getContainer().style.cursor = "pointer";
+        if (typeof global.deactivateElevationButtons === "function") {
+          global.deactivateElevationButtons();
+        }
+      },
+      // "⬆️"
+      ""
+    );
+
+    // Sichtbarkeit 
+    let _visible = true;
+    if (true) {
+      const type = "customdata";
+      const eyeButton = addSubBtn("Sichtbarkeit", () => {
+        // 1. Toggle the visual pane element.
+        const visible = togglePaneVisibility(map, type);
+
+        eyeButton.innerHTML = visible
+          ? '<img src="assets/eye-solid-full.svg" alt="Sichtbar" style="width: 1em; height: 1em; vertical-align: middle;"> Sichtbarkeit'
+          : '<img src="assets/eye-slash-solid-full.svg" alt="Unsichtbar" style="width: 1em; height: 1em; vertical-align: middle;"> Sichtbarkeit';
+      });
+      // Set the initial innerHTML of the eyeButton to show the full eye icon.
+      eyeButton.innerHTML =
+        '<img src="assets/eye-solid-full.svg" alt="Sichtbar" style="width: 1em; height: 1em; vertical-align: middle;"> Sichtbarkeit';
+    }
+
+    // Konfiguration
+    addSubBtn(
+      "Konfiguration",
+      () => {
+        console.log("Hamburger Submenu: Konfiguration clicked.");
+        if (
+          typeof global.sidepanel !== "undefined" &&
+          global.sidepanel.showCustomDataConfiguration
+        ) {
+          global.sidepanel.showCustomDataConfiguration("customdata");
+        }
+      },
+      // "🔳"
+      ""
+    );
+
+    // Objektübersicht (Data Panel)
+    addSubBtn(
+      "Objektübersicht",
+      () => {
+        console.log("Hamburger Submenu: Objektübersicht clicked.");
+        if (
+          typeof global.sidepanel !== "undefined" &&
+          global.sidepanel.showCustomData
+        ) {
+          global.sidepanel.showCustomData("customdata");
+        }
+      },
+      // "🔳"
+      ""
+    );
+
+    // Alle eigenen Objekte löschen
+    addSubBtn(
+      "Alle eigenen Objekte löschen",
+      async () => {
+        console.log("Hamburger Submenu: Alle eigenen Objekte löschen clicked.");
+        await clearAllCustomDataLayers();
+        visibilityBtn.innerHTML = getOverallCustomDataVisibility()
+          ? '<img src="assets/eye-solid-full.svg" alt="Sichtbar" style="width: 1em; height: 1em; vertical-align: middle;"> Sichtbarkeit'
+          : '<img src="assets/eye-slash-solid-full.svg" alt="Unsichtbar" style="width: 1em; height: 1em; vertical-align: middle;"> Sichtbarkeit: unsichtbar';
+      },
+      "", // "🗑️"
+    );
+
+     // Hilfe
+    addSubBtn("Hilfe", () => {
+      if (
+        typeof global.sidepanel !== "undefined" &&
+        global.sidepanel.showHelpHtml
+      ) {
+        global.sidepanel.showHelpHtml("customdata");
+      }
+    });
+
+    return hamburgerMainBtn;
+  }
+
+  // Hilfsfunktion zur Aktualisierung der Linienvorschau-SVG.
+  const updateLinePreview = (svgElement, style) => {
+      if (!svgElement) return;
+      const line = svgElement.querySelector('line');
+      if (!line) return;
+
+      line.style.stroke = style.color || 'blue';
+      line.style.strokeWidth = style.weight || 4;
+      line.style.strokeDasharray = style.dashArray || 'none';
+      line.style.strokeLinecap = style.lineCap || 'round';
+  };
+
+// Hilfsfunktion zum Einrichten eines Farbwählers.
+  const setupColorPicker = (inputId, initialColor, onPickCallback) => {
+
+    const colorInput = document.getElementById(inputId);
+
+    if (!colorInput || typeof global.ColorPicker === "undefined") {
+      console.warn(
+        `Farbwähler-Einrichtung übersprungen für #${inputId}: Input oder ColorPicker-Klasse nicht gefunden.`
+      );
+      return;
+    } else {
+      // console.log(`Farbwähler-Einrichtung erfolgreich für #${inputId}: Input und ColorPicker-Klasse gefunden.`);
+    }
+
+    const initialColorRgbaObj = global.parseColorStringToRgbaObject(initialColor);
+    const initialColorRgbaStr = global.rgbaObjectToString(initialColorRgbaObj);
+
+    const pickerInstance = new global.ColorPicker(colorInput, {
+      toggleStyle: "input",
+      headless: false,
+      enableAlpha: true,
+      color: initialColorRgbaStr,
+      enableEyedropper: false,
+      formats: ["hex", "rgba", "hsv", "hsl"],
+      defaultFormat: "rgba",
+      swatches: [
+        "rgba(139,0,0,1)", "rgba(255,0,0,1)", "rgba(255,69,0,1)", "rgba(255,165,0,1)",
+        "rgba(255,215,0,1)", "rgba(255,255,0,1)", "rgba(173,255,47,1)", "rgba(0,255,0,1)",
+        "rgba(144,238,144,1)", "rgba(64,224,208,1)", "rgba(0,255,255,1)", "rgba(135,206,235,1)",
+        "rgba(0,0,255,1)", "rgba(75,0,130,1)", "rgba(138,43,226,1)", "rgba(128,0,128,1)",
+        "rgba(55,30,70,1)", "rgba(255,0,255,1)",
+      ],
+      submitMode: "confirm",
+      showClearButton: false,
+      dismissOnOutsideClick: true,
+      dialogPlacement: "top",
+      dialogOffset: 8,
+    });
+
+    colorInput._colorpicker = pickerInstance;
+
+    pickerInstance.on("pick", (pickedColor) => {
+      const rgbaStr = pickedColor.string("rgba");
+      const rgbaObj = global.parseColorStringToRgbaObject(rgbaStr);
+
+      colorInput.value = rgbaStr;
+      colorInput.style.backgroundColor = rgbaStr;
+      colorInput.style.color = global.getTextColor(
+        global.rgbToHex(rgbaObj.r, rgbaObj.g, rgbaObj.b)
+      );
+      colorInput.dataset.color = rgbaStr;
+
+      if (typeof onPickCallback === "function") {
+        onPickCallback(rgbaStr);
+      }
+    });
+  };
+
+  // Hilfsfunktion, um Stilattribute für die HTML-Vorlage zu erhalten.
+  const getColorStylesForTemplate = (colorString, defaultColor) => {
+    const color = colorString || defaultColor;
+    const rgbaObj = global.parseColorStringToRgbaObject(color);
+    const textColor = global.getTextColor(
+      global.rgbToHex(rgbaObj.r, rgbaObj.g, rgbaObj.b)
+    );
+    return {
+      bgColor: color,
+      textColor: textColor,
+    };
+  };
+
+ /*
+    html für default Konfiguration 
+  */
+  global.getCustomDataConfigurationPanelHtml = function (idSuffix = "") {
+    idSuffix = "-default"; 
+    
+    const lineStyle = _customDataOptionsLast.lineStyle || {};
+    const pointStyle = _customDataOptionsLast.pointStyle || {};
+
+    const lineStyleTpl = getColorStylesForTemplate(lineStyle.color, "#613583");
+    const pointFillStyleTpl = getColorStylesForTemplate(pointStyle.fillColor, "#ff0000");
+    const pointBorderStyleTpl = getColorStylesForTemplate(pointStyle.color, "#000");
+    
+    return `
+        <!-- Style Controls -->
+        <div class="client" id="style-controls${idSuffix}">
+          <!-- <h4>Darstellung:</h4> -->
+          ${MapStyleManager.getHtml(
+            _customDataOptionsLast.styleOptions,
+            idSuffix
+          )}
+        </div>
+
+        <hr>
+
+        <div>
+          <b>Hinweis:</b> Die nachfolgende Konfiguration der Standardstile wirkt auf neu importierte Objekte.         
+          Die Darstellung bereits importierten Objekte kann unter "Objektübersicht" geändert werden.
+        </div>
+
+        <hr>
+
+        <div id="customdata-config-area" class="customdata-config-area">
+
+          <h4>Standardstil für Linien:</h4>    
+
+          <label>Farbe:</label>
+          <div class="color-row">
+            <div class="color-cell">
+              <input type="text"
+                  id="config-line-color${idSuffix}"
+                  value="${lineStyleTpl.bgColor}"
+                  tabindex="-1" readonly class="cp_input color-input"
+                  data-color="${lineStyleTpl.bgColor}"
+                  style="background-color: ${lineStyleTpl.bgColor}; color: ${lineStyleTpl.textColor};">
+            </div>
+          </div>          
+          
+          ${global.makeSlider(
+            "line-weight",
+            idSuffix,
+            "Linienstärke",
+            lineStyle.weight || 4,
+            1,
+            10,
+            1,
+            0
+          )}
+
+          <br>
+
+          <label>Linientyp:</label>
+          <div class="radio-group" style="margin-top: 5px; margin-bottom: 15px;">
+            <input type="radio" id="line-type-solid${idSuffix}" name="line-type${idSuffix}" value="solid" ${!lineStyle.dashArray ? 'checked' : ''}>
+            <label for="line-type-solid${idSuffix}" style="margin-right: 15px;">durchgezogene Linie</label>
+            <input type="radio" id="line-type-dashed${idSuffix}" name="line-type${idSuffix}" value="dashed" ${lineStyle.dashArray ? 'checked' : ''}>
+            <label for="line-type-dashed${idSuffix}">gestrichelte Linie</label>
+          </div>
+
+          <div class="dash-pattern-container" style="display: ${lineStyle.dashArray ? 'block' : 'none'};">
+            <label for="config-line-dasharray${idSuffix}">Muster (z.B. "5,10" für gestrichelt):</label>
+            <br><br>
+            <div>
+              <input type="text" id="config-line-dasharray${idSuffix}" class="config-line-dasharray" value="${lineStyle.dashArray || "5,10"}">
+            </div>
+          </div>
+          
+          <br>
+
+          <label>Linienenden:</label>
+          <div class="radio-group" style="margin-top: 5px; margin-bottom: 15px;">
+            <input type="radio" id="line-cap-butt${idSuffix}" name="line-cap${idSuffix}" value="butt" ${lineStyle.lineCap === 'butt' ? 'checked' : ''}>
+            <label for="line-cap-butt${idSuffix}" style="margin-right: 15px;">Butt</label>
+            <input type="radio" id="line-cap-round${idSuffix}" name="line-cap${idSuffix}" value="round" ${lineStyle.lineCap === 'round' ? 'checked' : ''}>
+            <label for="line-cap-round${idSuffix}" style="margin-right: 15px;">Round</label>
+            <input type="radio" id="line-cap-square${idSuffix}" name="line-cap${idSuffix}" value="square" ${lineStyle.lineCap === 'square' ? 'checked' : ''}>
+            <label for="line-cap-square${idSuffix}">Square</label>
+          </div>
+
+          <label>Vorschau:</label>
+          <div class="line-preview-container">
+            <svg id="line-style-preview${idSuffix}" width="100%" height="20">
+                <line x1="5" y1="10" x2="195" y2="10" />
+            </svg>
+          </div>
+
+          <h4>Standardstil für Punkte:</h4>          
+
+          <label>Füllfarbe: </label>
+          <div class="color-row">
+            <div class="color-cell">
+              <input type="text"
+                  id="config-point-fillcolor${idSuffix}"
+                  value="${pointFillStyleTpl.bgColor}"
+                  tabindex="-1" readonly class="cp_input color-input"
+                  data-color="${pointFillStyleTpl.bgColor}"
+                  style="background-color: ${pointFillStyleTpl.bgColor}; color: ${pointFillStyleTpl.textColor};">
+            </div>
+          </div>
+
+          <label>Randfarbe: </label>
+          <div class="color-row">
+            <div class="color-cell">
+              <input type="text"
+                  id="config-point-color${idSuffix}"
+                  value="${pointBorderStyleTpl.bgColor}"
+                  tabindex="-1" readonly class="cp_input color-input"
+                  data-color="${pointBorderStyleTpl.bgColor}"
+                  style="background-color: ${pointBorderStyleTpl.bgColor}; color: ${pointBorderStyleTpl.textColor};">
+            </div>
+          </div>
+
+          ${global.makeSlider(
+            "point-radius",
+            idSuffix,
+            "Radius",
+            pointStyle.radius || 4,
+            1,
+            20,
+            1,
+            0
+          )}
+
+          ${global.makeSlider(
+            "point-weight",
+            idSuffix,
+            "Randstärke",
+            pointStyle.weight || 1,
+            0,
+            5,
+            1,
+            0
+          )}
+
+
+          <div class="panel-buttons">
+              <button type="button" class="customdata-apply-config-btn" data-id="0">Standardstile speichern</button>
+          </div>
+        </div>       
+        `;
+  };
+
+  /*
+    helper für default Konfiguration 
+  */
+  global.initCustomDataConfigurationPanelHelper = function (idSuffix) {
+    idSuffix = "-default"; 
+
+    if (typeof MapStyleManager === "undefined") {
+      console.error("MapStyleManager not defined.");
+      return;
+    }
+
+    const styleManager = new MapStyleManager(
+      _saveSettings,
+      () => global.redrawCustomData()
+    );
+    styleManager.init(_customDataOptionsLast.styleOptions, idSuffix);
+
+    applyGlobalCustomDataStyleToPane();
+
+    const panelElement = document.getElementById(`customdata-config-area`);
+    if (!panelElement) {
+      console.error(`CustomData panel element "customdata-config-area" not found.`);
+      return;
+    }
+    
+    const previewSvg = document.getElementById(`line-style-preview${idSuffix}`);
+
+    const updateAndRedraw = () => {
+      updateLinePreview(previewSvg, _customDataOptionsLast.lineStyle);
+      _saveSettings();
+      // global.redrawCustomData(); // das muss hier nicht sein !
+    };
+
+    const lineStyle = _customDataOptionsLast.lineStyle;
+    const pointStyle = _customDataOptionsLast.pointStyle;
+
+    setupColorPicker(`config-line-color${idSuffix}`, lineStyle.color, (newColor) => {
+      lineStyle.color = newColor;
+      updateAndRedraw();
+    });
+    setupColorPicker(`config-point-fillcolor${idSuffix}`, pointStyle.fillColor, (newColor) => {
+      pointStyle.fillColor = newColor;
+      updateAndRedraw();
+    });
+    setupColorPicker(`config-point-color${idSuffix}`, pointStyle.color, (newColor) => {
+      pointStyle.color = newColor;
+      updateAndRedraw();
+    });
+
+    // --- Radio Button Logic for Line Type ---
+    const solidRadio = panelElement.querySelector(`#line-type-solid${idSuffix}`);
+    const dashedRadio = panelElement.querySelector(`#line-type-dashed${idSuffix}`);
+    const dashPatternContainer = panelElement.querySelector('.dash-pattern-container');
+    const dashInput = panelElement.querySelector('.config-line-dasharray');
+
+    if(solidRadio && dashedRadio && dashPatternContainer && dashInput) {
+      solidRadio.addEventListener('change', () => {
+        if (solidRadio.checked) {
+          dashPatternContainer.style.display = 'none';
+          lineStyle.dashArray = "";
+          updateAndRedraw();
+        }
+      });
+
+      dashedRadio.addEventListener('change', () => {
+        if (dashedRadio.checked) {
+          dashPatternContainer.style.display = 'block';
+          lineStyle.dashArray = dashInput.value.trim() || "5,10"; // Use current or default value
+          dashInput.value = lineStyle.dashArray;
+          updateAndRedraw();
+        }
+      });
+
+      dashInput.addEventListener('input', () => {
+        if (dashedRadio.checked) {
+          lineStyle.dashArray = dashInput.value.trim();
+          updateAndRedraw();
+        }
+      });
+    }
+
+    // --- Radio Button Logic for Line Cap ---
+    const lineCapRadios = panelElement.querySelectorAll(`input[name="line-cap${idSuffix}"]`);
+    lineCapRadios.forEach(radio => {
+      radio.addEventListener('change', () => {
+        if (radio.checked) {
+          lineStyle.lineCap = radio.value;
+          updateAndRedraw();
+        }
+      });
+    });
+
+    global.bindSlider(
+      "line-weight",
+      idSuffix,
+      "weight", 
+      _customDataOptionsLast.lineStyle, 
+      false,
+      0,
+      parseInt,
+      _customDataOptionsLast.lineStyle, 
+      _saveSettings,
+      () => {
+          updateLinePreview(previewSvg, _customDataOptionsLast.lineStyle);
+          //global.redrawCustomData();
+          updateAndRedraw();
+      }
+    );
+
+    global.bindSlider(
+      "point-radius",
+      idSuffix,
+      "radius",
+      _customDataOptionsLast.pointStyle,
+      false,
+      0,
+      parseInt,
+      _customDataOptionsLast.pointStyle,
+      _saveSettings,
+      () => global.redrawCustomData()
+    );
+
+    global.bindSlider(
+      "point-weight",
+      idSuffix,
+      "weight",
+      _customDataOptionsLast.pointStyle,
+      false,
+      0,
+      parseInt,
+      _customDataOptionsLast.pointStyle,
+      _saveSettings,
+      () => global.redrawCustomData()
+    );
+
+    const applyButton = panelElement.querySelector(".customdata-apply-config-btn");
+    if (applyButton) {
+        applyButton.addEventListener("click", async function (e) {
+          console.log("customdata-apply-config-btn click");
+          e.stopPropagation();
+
+          _customDataOptionsLast.lineStyle.color = panelElement.querySelector(`#config-line-color${idSuffix}`).value;
+          
+          if(dashedRadio && dashedRadio.checked) {
+             _customDataOptionsLast.lineStyle.dashArray = panelElement.querySelector(".config-line-dasharray").value.trim();
+          } else {
+             _customDataOptionsLast.lineStyle.dashArray = "";
+          }
+
+          _customDataOptionsLast.pointStyle.fillColor = panelElement.querySelector(`#config-point-fillcolor${idSuffix}`).value;
+          _customDataOptionsLast.pointStyle.color = panelElement.querySelector(`#config-point-color${idSuffix}`).value;
+
+          updateAndRedraw(); 
+        });
+    }
+
+    // Initial preview render
+    updateLinePreview(previewSvg, lineStyle);
+  };
+
+  /*
+    html für Konfiguration eines selektierten items  
+  */
+  global.getCustomDataItemPanelHtml = function (idSuffix = "") {
+    // console.log("getCustomDataPanelHtml called with suffix:", idSuffix);
+
+    let html = `
+    <div id="customdata-panel-${idSuffix}" class="customdata-panel">
+      <div id="customdata-list-${idSuffix}" class="entry-list">
+  `;
+
+    if (!_myCustomdataMap || _myCustomdataMap.size === 0) {
+      /* html += `<p>Noch keine Objekte importiert. Nutzen Sie "Importieren" im Menü, um Ihr erstes Objekt hinzuzufügen!</p>`; */
+      html += `<div class="entry-list"><p style="color: #777; font-style: italic; padding: 10px;">Noch kein Objekt importiert.</p></div>`;
+    } else {
+      _myCustomdataMap.forEach((item) => {
+        const isVisible = typeof item.visible === "boolean" ? item.visible : true;
+        const visibilityClass = isVisible ? "is-visible" : "is-hidden";
+        const itemId = item.id ? String(item.id) : "";
+        const itemName = item.name || "Unnamed File";
+
+        const itemStyle = item.style || {};
+        const lineStyle = itemStyle.line || {};
+        const pointStyle = itemStyle.point || {};
+
+        const lineStyleTpl = getColorStylesForTemplate(lineStyle.color, "#613583");
+        const pointFillStyleTpl = getColorStylesForTemplate(pointStyle.fillColor, "#ff0000");
+        const pointBorderStyleTpl = getColorStylesForTemplate(pointStyle.color, "#000");
+
+        const visibilityButtonContent = isVisible
+          ? `<img src="assets/eye-solid-full.svg" alt="Sichtbar" style="width: 1em; height: 1em; vertical-align: middle;"> `
+          : `<img src="assets/eye-slash-solid-full.svg" alt="Unsichtbar" style="width: 1em; height: 1em; vertical-align: middle;"> `;
+
+        html += `
+    <details class="customdata-item-details entry-list" data-id="${itemId}">
+      <summary class="customdata-item-summary">
+        <span class="customdata-item-name">${itemName}</span>
+        <span class="customdata-item-actions-summary">
+          <button class="customdata-position-btn" data-id="${itemId}" title="Auf Karte zentrieren">🔍</button>
+          <button class="customdata-toggle-visibility-btn ${visibilityClass}" data-id="${itemId}" title="Sichtbarkeit umschalten">${visibilityButtonContent}</button>
+          <button class="customdata-remove-btn" data-id="${itemId}" title="Datei entfernen">🗑️</button>
+        </span>
+      </summary>
+      <!-- -->
+      <div class="customdata-config-area
+" data-id="${itemId}">
+        <!--
+        <span class="customdata-item-name">${itemName}</span>
+        -->
+        <h4>Stil für Linien:</h4>
+        
+        <label>Farbe: </label>
+        <div class="color-row">
+          <div class="color-cell">
+            <input type="text"
+                id="config-line-color-for-item-${itemId}"
+                value="${lineStyleTpl.bgColor}"
+                tabindex="-1" readonly class="cp_input color-input"
+                data-color="${lineStyleTpl.bgColor}"
+                style="background-color: ${lineStyleTpl.bgColor}; color: ${lineStyleTpl.textColor};">
+          </div>
+        </div>
+
+        ${global.makeSlider(
+          `line-weight-input-`,
+          itemId,
+          "Linienstärke",
+          lineStyle.weight || 5,
+          1,
+          10,
+          1,
+          0
+        )}
+
+        <br>
+
+        <label>Linientyp:</label>
+        <div class="radio-group" style="margin-top: 5px; margin-bottom: 15px;">
+          <input type="radio" id="line-type-solid-for-item-${itemId}" name="line-type-for-item-${itemId}" value="solid" ${!lineStyle.dashArray ? 'checked' :
+ ''}>
+          <label for="line-type-solid-for-item-${itemId}" style="margin-right: 15px;">durchgezogene Linie</label>
+          <input type="radio" id="line-type-dashed-for-item-${itemId}" name="line-type-for-item-${itemId}" value="dashed" ${lineStyle.dashArray ? 'checked' : ''}>
+          <label for="line-type-dashed-for-item-${itemId}">gestrichelte Linie</label>
+        </div>
+
+        <div class="dash-pattern-container-for-item" style="display: ${lineStyle.dashArray ? 'block' : 'none'};">
+            <label for="config-line-dasharray-for-item-${itemId}">Muster (z.B. "5,10" für gestrichelt):</label>
+            <br><br>
+            <input type="text" id="config-line-dasharray-for-item-${itemId}" class="config-line-dasharray-for-item" value="${lineStyle.dashArray || '5,10'}">
+        </div>
+        
+        <br>
+
+        <label>Linienenden:</label>
+        <div class="radio-group" style="margin-top: 5px; margin-bottom: 15px;">
+          <input type="radio" id="line-cap-butt-for-item-${itemId}" name="line-cap-for-item-${itemId}" value="butt" ${lineStyle.lineCap === 'butt' ? 'checked' : ''}>
+          <label for="line-cap-butt-for-item-${itemId}" style="margin-right: 15px;">Butt</label>
+          <input type="radio" id="line-cap-round-for-item-${itemId}" name="line-cap-for-item-${itemId}" value="round" ${lineStyle.lineCap === 'round' ? 'checked' : ''}>
+          <label for="line-cap-round-for-item-${itemId}" style="margin
+-right: 15px;">Round</label>
+          <input type="radio" id="line-cap-square-for-item-${itemId}" name="line-cap-for-item-${itemId}" value="square" ${lineStyle.lineCap === 'square' ? 'checked' : ''}>
+          <label for="line-cap-square-for-item-${itemId}">Square</label>
+        </div>
+
+        <label>Vorschau:</label>
+        <div class="line-preview-container">
+            <svg id="line-style-preview-for-item-${itemId}" width="100%" height="20">
+                <line x1="5" y1="10" x2="195" y2="10" />
+            </svg>
+        </div>
+
+        <h4>Stil für Punkte:</h4>        
+        
+        <label>Füllfarbe: </label>
+        <div class="color-row">
+          <div class="color-cell">
+            <input type="text"
+                id="config-point-fillcolor-for-item-${itemId}"
+                value="${pointFillStyleTpl.bgColor}"
+                tabindex="-1" readonly class="cp_input color-input"
+                data-color="${pointFillStyleTpl.bgColor}"
+                style="background-color: ${pointFillStyleTpl.bgColor}; color: ${pointFillStyleTpl.textColor};">
+          </div>
+        </div>
+
+        <label>Randfarbe: </label>
+        <div class="color-row">
+          <div class="color-cell">
+            <input type="text"
+                id="config-point-color-for-item-${itemId}"
+                value="${pointBorderStyleTpl.bgColor}"
+                tabindex="-1" readonly class="cp_input color-input"
+                data-color="${pointBorderStyleTpl.bgColor}"
+                style="background-color: ${pointBorderStyleTpl.bgColor}; color: ${pointBorderStyleTpl.textColor};">
+          </div>
+        </div>
+        
+        ${global.makeSlider(
+          `point-radius-input-`,
+          itemId,
+          "Radius",
+          pointStyle.radius || 8,
+          1,
+          20,
+          1,
+          0
+        )}
+
+        ${global.makeSlider(
+          `point-weight-input-`,
+          itemId,
+          "Randstärke",
+          pointStyle.weight || 1,
+          0,
+          5,
+          1,
+          0
+        )}
+
+        <!--
+        <div class="panel-buttons">
+            <button type="button" class="customdata-apply-config-btn" data-id="${itemId}">Stil anwenden ...</button>
+        </div>
+        -->
+      </div>
+      <!-- -->
+    </details>
+  `;
+      });
+    }
+
+    html += `
+      </div>
+      <!--
+      <p><small>Die Objekte werden lokal in Ihrem Browser gespeichert (Origin Private File System).</small></p>
+      -->
+    </div>
+  `;
+    return html;
+  };
+
+  /*
+    helper für Konfiguration eines selektierten items  
+  */
+  global.initCustomDataItemPanelHelper = function (idSuffix) {
+    idSuffix = ""; // TODO Hack !!!
+
+    const panelElement = document.getElementById(`customdata-panel-${idSuffix}`);
+    if (!panelElement) {
+      console.error(`CustomData panel element "customdata-panel-${idSuffix}" not found.`);
+      return;
+    }
+
+    /**
+     * Redraws a given map item by reloading its data and applying its current style.
+     * @param {object} item The metadata item for the custom data layer.
+     */
+    const redrawAndSaveItem = async (item) => {
+
+        console.log("redrawAndSaveItem item: ", item.style);
+
+        if (!item) return;
+        
+        const previewSvg = document.getElementById(`line-style-preview-for-item-${item.id}`);
+        updateLinePreview(previewSvg, item.style.line);
+
+        // Remove the existing layer from the map if it exists
+        if (item.layer && global.map && global.map.hasLayer(item.layer)) {
+            global.map.removeLayer(item.layer);
+            item.layer = null;
+        }
+
+        const fileNameInOpfs = item.opfsPath.split("/").pop();
+        const fileContent = await loadCustomDataFile(fileNameInOpfs);
+
+        if (fileContent) {
+            const geojson = parseFileContentToGeoJson(fileContent, item.fileType, item.name);
+            if (geojson) {
+                // Display the new GeoJSON with the item's current style properties
+                displayCustomDataGeoJson(geojson, item.name, item.id, item.opfsPath, item.fileType, item.visible, item.style);
+            }
+        }
+        await saveMetadata(); // Persist metadata changes
+        console.log(`Style for "${item.name}" updated and redrawn.`);
+    };
+
+    // Iterate over each custom data item within the panel
+    panelElement.querySelectorAll(".customdata-item-details").forEach(detailsElement => {
+        const itemId = detailsElement.dataset.id;
+        const item = _myCustomdataMap.get(itemId);
+        if (!item) return;
+        
+        const previewSvg = document.getElementById(`line-style-preview-for-item-${itemId}`);
+
+        const configArea = detailsElement.querySelector('.customdata-config-area');
+        if (!configArea) return;
+
+        /**
+         * Reads all style values from the UI controls and updates the item's style object.
+         */
+        const updateItemStyleFromUI = () => {
+
+            // console.log("updateItemStyleFromUI itemId: ", itemId);
+
+            /*
+            // Read values from text and color inputs
+            item.style.line.color = configArea.querySelector(`#config-line-color-for-item-${itemId}`).value;
+            console.log("updateItemStyleFromUI item.style.line.color: ", item.style.line.color);
+            item.style.line.dashArray = configArea.querySelector(`.config-line-dasharray-for-item-${itemId}`).value.trim() || null;
+            // item.style.line.trackColor = configArea.querySelector(`.config-line-trackcolor-for-item-${itemId}`).value;
+            item.style.point.fillColor = configArea.querySelector(`#config-point-fillcolor-for-item-${itemId}`).value;
+            item.style.point.color = configArea.querySelector(`#config-point-color-for-item-${itemId}`).value;
+            */
+
+            // Read values from sliders
+            const lineWeightInput = configArea.querySelector(`#line-weight-input-${itemId}`);
+            console.log("updateItemStyleFromUI lineWeightInput: ", lineWeightInput);
+            if (lineWeightInput) item.style.line.weight = parseInt(lineWeightInput.value, 10);
+            // console.log("updateItemStyleFromUI item.style.line.weight: ", item.style.line.weight);
+
+            const pointRadiusInput = configArea.querySelector(`#point-radius-input-${itemId}`);
+            if (pointRadiusInput) item.style.point.radius = parseInt(pointRadiusInput.value, 10);
+
+            const pointWeightInput = configArea.querySelector(`#point-weight-input-${itemId}`);
+            if (pointWeightInput) item.style.point.weight = parseInt(pointWeightInput.value, 10);
+        };
+
+        // This callback is passed to the sliders for real-time updates.
+        const redrawCallback = () => {
+            // console.log("redrawCallback");
+            updateItemStyleFromUI();
+            redrawAndSaveItem(item);
+        };
+
+        setupColorPicker(`config-line-color-for-item-${itemId}`, item.style.line.color, (newColor) => {
+            item.style.line.color = newColor;
+            redrawAndSaveItem(item);
+        });
+        setupColorPicker(`config-point-fillcolor-for-item-${itemId}`, item.style.point.fillColor, (newColor) => {
+            item.style.point.fillColor = newColor;
+            redrawAndSaveItem(item);
+        });
+        setupColorPicker(`config-point-color-for-item-${itemId}`, item.style.point.color, (newColor) => {
+            item.style.point.color = newColor;
+            redrawAndSaveItem(item);
+        });
+
+        // --- Radio Button Logic for Item Line Type ---
+        const solidRadioItem = configArea.querySelector(`#line-type-solid-for-item-${itemId}`);
+        const dashedRadioItem = configArea.querySelector(`#line-type-dashed-for-item-${itemId}`);
+        const dashPatternContainerItem = configArea.querySelector('.dash-pattern-container-for-item');
+        const dashInputItem = configArea.querySelector('.config-line-dasharray-for-item');
+
+        if (solidRadioItem && dashedRadioItem && dashPatternContainerItem && dashInputItem) {
+            solidRadioItem.addEventListener('change', () => {
+                if (solidRadioItem.checked) {
+                    dashPatternContainerItem.style.display = 'none';
+                    item.style.line.dashArray = "";
+                    redrawAndSaveItem(item);
+                }
+            });
+
+            dashedRadioItem.addEventListener('change', () => {
+                if (dashedRadioItem.checked) {
+                    dashPatternContainerItem.style.display = 'block';
+                    item.style.line.dashArray = dashInputItem.value.trim() || "5,10";
+                    dashInputItem.value = item.style.line.dashArray;
+                    redrawAndSaveItem(item);
+                }
+            });
+
+            dashInputItem.addEventListener('input', () => {
+                if (dashedRadioItem.checked) {
+                    item.style.line.dashArray = dashInputItem.value.trim();
+                    redrawAndSaveItem(item);
+                }
+            });
+        }
+
+        // --- Radio Button Logic for Item Line Cap ---
+        const lineCapRadiosItem = configArea.querySelectorAll(`input[name="line-cap-for-item-${itemId}"]`);
+        lineCapRadiosItem.forEach(radio => {
+          radio.addEventListener('change', () => {
+            if (radio.checked) {
+              item.style.line.lineCap = radio.value;
+              redrawAndSaveItem(item);
+            }
+          });
+        });
+
+        // redrawAndSaveItem(item) is not correct !!! redrawAndSaveItem gets stale values !!! 
+        /*
+        global.bindSlider(`line-weight-input-`, itemId, "weight", item.style.line, false, 0, parseInt, item.style.line, saveMetadata, () => redrawAndSaveItem(item));
+        global.bindSlider(`point-radius-input-`, itemId, "radius", item.style.point, false, 0, parseInt, item.style.point, saveMetadata, () => redrawAndSaveItem(item));
+        global.bindSlider(`point-weight-input-`, itemId, "weight", item.style.point, false, 0, parseInt, item.style.point, saveMetadata, () => redrawAndSaveItem(item));
+        */
+        
+        // Correctly bind sliders by passing the function reference 'redrawCallback'
+        global.bindSlider(`line-weight-input-`, itemId, "weight", item.style.line, false, 0, parseInt, item.style.line, saveMetadata, redrawCallback);
+        global.bindSlider(`point-radius-input-`, itemId, "radius", item.style.point, false, 0, parseInt, item.style.point, saveMetadata, redrawCallback);
+        global.bindSlider(`point-weight-input-`, itemId, "weight", item.style.point, false, 0, parseInt, item.style.point, saveMetadata, redrawCallback);
+
+        // Initial preview render for each item
+        updateLinePreview(previewSvg, item.style.line);
+    });
+
+    // Use event delegation for common button actions (more efficient).
+    panelElement.addEventListener("click", async (e) => {
+        const button = e.target.closest("button");
+        if (!button) return;
+
+        const itemId = button.dataset.id;
+        if (!itemId) return;
+
+        const item = _myCustomdataMap.get(itemId);
+
+        // Visibility Toggle
+        if (button.classList.contains("customdata-toggle-visibility-btn")) {
+            e.stopPropagation();
+            if (item) {
+                global.toggleCustomDataLayerVisibility(itemId, !item.visible);
+            }
+        }
+
+        // Remove Button
+        if (button.classList.contains("customdata-remove-btn")) {
+            e.stopPropagation();
+            const itemName = (item || {}).name || itemId;
+            if (confirm(`Möchten Sie die Datei "${itemName}" wirklich entfernen?`)) {
+                await global.removeCustomDataLayer(itemId);
+            }
+        }
+
+        // Position/Zoom Button
+        if (button.classList.contains("customdata-position-btn")) {
+            e.stopPropagation();
+            if (item && item.layer && global.map) {
+                const layer = item.layer;
+                const wasVisible = global.map.hasLayer(layer);
+
+                if (!wasVisible) layer.addTo(global.map);
+
+                if (layer.getBounds && layer.getBounds().isValid()) {
+                    // KTO
+                    // global.map.fitBounds(layer.getBounds(), { padding: [20, 20] });
+                    global.map.fitBounds(layer.getBounds(), { padding: [20, 20], maxZoom: 16 }); 
+               }
+
+                if (!wasVisible && !item.visible) {
+                    global.map.removeLayer(layer);
+                }
+            } else {
+                console.warn(`Layer with ID ${itemId} not found or has no valid bounds.`);
+            }
+        }
+    });
+  };
+
+  async function _saveSettings() {
+    localStorage.setItem(
+      "customdata_configuration",
+      JSON.stringify(_customDataOptionsLast)
+    );
+  }
+
+  async function _loadSettings() {
+    try {
+      const storedOptions = localStorage.getItem("customdata_configuration");
+      if (storedOptions) {
+        _customDataOptionsLast = {
+          ...CUSTOMDATA_OPTIONS_DEFAULTS,
+          ...JSON.parse(storedOptions),
+          styleOptions: {
+            ...CUSTOMDATA_OPTIONS_DEFAULTS.styleOptions,
+            ...(JSON.parse(storedOptions).styleOptions || {}),
+          },
+        };        
+      }
+    } catch (error) {
+      console.error(
+        "Failed to load customdata options from localStorage:",
+        error
+      );
+      _customDataOptionsLast = { ...CUSTOMDATA_OPTIONS_DEFAULTS }; 
+    }
+  }
+
+  async function saveCustomDataLayers() {
+    // So, no explicit action needed here for now, but kept for sidepanel interface consistency.
+  }
+  async function loadCustomDataLayers() {
+    // It exists for sidepanel interface consistency.
+  }
+
+  async function llloadCustomData() {
+    const storedLayersMetadata = await loadMetadata();
+    if (!storedLayersMetadata || storedLayersMetadata.length === 0) {
+      return;
+    }
+   
+    for (const item of storedLayersMetadata) {
+      if (item.opfsPath) {
+        const fileNameInOpfs = item.opfsPath.split("/").pop(); 
+        const fileContent = await loadCustomDataFile(fileNameInOpfs);
+
+        if (fileContent) {
+          const geojson = parseFileContentToGeoJson(
+            fileContent,
+            item.fileType,
+            item.name
+          );
+          if (geojson) {
+            item.visible = true;
+            displayCustomDataGeoJson(
+              geojson,
+              item.name,
+              item.id,
+              item.opfsPath,
+              item.fileType,
+              item.visible,
+              item.style
+            );
+          }
+        }
+      }
+    }
+  }
+  async function loadCustomData() {
+    const storedLayersMetadata = await loadMetadata();
+    if (!storedLayersMetadata || storedLayersMetadata.length === 0) {
+      return;
+    }
+
+    const loadPromises = storedLayersMetadata.map(async (item) => {
+      if (item.opfsPath) {
+        const fileNameInOpfs = item.opfsPath.split("/").pop();
+        const fileContent = await loadCustomDataFile(fileNameInOpfs);
+
+        if (fileContent) {
+          // Offload parsing to a macrotask to avoid blocking the main thread
+          return new Promise((resolve) => {
+            setTimeout(() => {
+              const geojson = parseFileContentToGeoJson(
+                fileContent,
+                item.fileType,
+                item.name
+              );
+              if (geojson) {
+                item.visible = true; // or stored visibility state
+                // Schedule display in the next available animation frame
+                requestAnimationFrame(() => {
+                  displayCustomDataGeoJson(
+                    geojson,
+                    item.name,
+                    item.id,
+                    item.opfsPath,
+                    item.fileType,
+                    item.visible,
+                    item.style
+                  );
+                });
+              }
+              resolve();
+            }, 0);
+          });
+        }
+      }
+    });
+
+    await Promise.all(loadPromises);
+  }
+
+
+  async function saveMetadata() {
+    const serializableLayers = Array.from(_myCustomdataMap.values()).map((item) => ({
+      id: item.id,
+      name: item.name,
+      opfsPath: item.opfsPath,
+      visible: item.visible,
+      fileType: item.fileType,
+      style: item.style, 
+    }));
+
+    const metadataContent = JSON.stringify(serializableLayers, null, 2);
+
+    persist("", CUSTOMDATA_MASTER_NAME, metadataContent);   
+  }
+
+  async function loadMetadata() {
+    try {
+      const content = await retrieve("", CUSTOMDATA_MASTER_NAME);
+
+      if (content === "") {
+        return [];
+      }
+
+      const loadedMetadata = JSON.parse(content);
+      return loadedMetadata;
+    } catch (error) {
+      console.error(`Failed to load custom data metadata file from OPFS:`, error);
+      return null;
+    }
+  }
+
+  async function loadCustomDataFile(fileNameInOpfs) {
+    try {      
+      const content = await retrieve(CUSTOMDATA_DIR_NAME, fileNameInOpfs);     
+      return content;
+    } catch (error) {
+      console.error(`Failed to load custom data file "${fileNameInOpfs}" from OPFS:`, error);
+      return null;
+    }
+  }
+
+  async function deleteCustomDataFile(fileNameInOpfs) {
+    try {
+      await remove(CUSTOMDATA_DIR_NAME, fileNameInOpfs);
+    } catch (error) {
+      console.error(`Failed to delete file "${fileNameInOpfs}" from OPFS:`, error);
+      return null;
+    }
+  }
+  
+  document.addEventListener("DOMContentLoaded", () => {
+    global.initcustomdata();
+  })
+})(window); // Pass `window` as 'global' to the IIFE
