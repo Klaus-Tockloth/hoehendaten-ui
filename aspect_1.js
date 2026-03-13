@@ -3,8 +3,6 @@
 /* global createTileManager */ 
 /* global createLoadingSpinner */ 
 
-import { createTileManager } from "./map-tile-manager.js";
-
 const aspect_url = "https://api.hoehendaten.de:14444/v1/aspect";
 
 const txt_aspect = "Hangexposition";
