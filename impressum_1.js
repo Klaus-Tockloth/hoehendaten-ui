@@ -62,7 +62,7 @@ document.addEventListener('DOMContentLoaded', function() {
         // Set the target URL based on the domain check
         // Note: I added the .html extension, assuming it's an HTML file. 
         // If your server routes it without the extension, just use '/impressum_Franz'
-        const targetUrl = isJokoart ? '/impressum_Franz.html' : '/impressum.html';
+        const targetUrl = isJokoart ? './impressum_Franz.html' : './impressum.html';
 
         fetch(targetUrl)
             .then(response => response.text())
