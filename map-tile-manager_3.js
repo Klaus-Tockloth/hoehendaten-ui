@@ -1101,23 +1101,11 @@ function createTileManager(config) {
   }
 
   function updateDataInSidepanel() {
-    if (
-      typeof sidepanel !== "undefined" &&
-      typeof sidepanel.showOptions === "function"
-    ) {
-      const sidePanel = document.querySelector(".side-panel");
-      const isVisible = !!(sidePanel && sidePanel.offsetParent !== null);
-      if (isVisible) {
-        const element = document.querySelector(".side-panel-title");
-        if (
-          element &&
-          element.textContent.includes(
-            "Daten"
-          ) 
-        ) {
-          sidepanel.showData(type);
-        }
-      }
+    const sidePanelOpen = document.querySelector(".side-panel.open");
+    const title = sidePanelOpen?.querySelector(".side-panel-title");
+
+    if (sidepanel?.showOptions && title?.textContent.includes("Daten")) {
+      sidepanel.showData(type);
     }
   }
  
